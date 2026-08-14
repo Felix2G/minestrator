@@ -1,0 +1,103 @@
+name: Auto Renew MineStrator Server
+
+on:
+  push:
+    branches: [main]
+  schedule:
+    - cron: '0 */3 * * *'
+  workflow_dispatch:
+
+permissions:
+  actions: write
+  contents: write
+
+jobs:
+  check-config:
+    runs-on: ubuntu-latest
+    outputs:
+      configured: ${{ steps.check.outputs.configured }}
+    steps:
+      - name: 检查 MineStrator 运行配置
+        id: check
+        env:
+          MINESTRATOR_PASSWORD: ${{ secrets.MINESTRATOR_PASSWORD }}
+          MINESTRATOR_EMAIL: ${{ secrets.MINESTRATOR_EMAIL }}
+          MINESTRATOR_SERVER_ID: ${{ secrets.MINESTRATOR_SERVER_ID }}
+        run: |
+          if [ -n "$MINESTRATOR_PASSWORD" ] && [ -n "$MINESTRATOR_EMAIL" ] && [ -n "$MINESTRATOR_SERVER_ID" ]; then
+            echo "configured=true" >> $GITHUB_OUTPUT
+            echo "✅ MineStrator 账号配置已就绪，准备执行保活。"
+          else
+            echo "configured=false" >> $GITHUB_OUTPUT
+            echo "ℹ️ 未检测到完整的必填 Secrets (MINESTRATOR_EMAIL / MINESTRATOR_PASSWORD / MINESTRATOR_SERVER_ID)，已安全跳过本次保活任务。"
+            echo "👉 若需启用保活，请在仓库 Settings → Secrets and variables → Actions 中配置对应变量。"
+          fi
+
+  renew:
+    needs: check-config
+    if: needs.check-config.outputs.configured == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update && sudo apt-get install -y xvfb
+          pip install -r requirements.txt
+          python -m playwright install chromium --with-deps
+
+      - name: Run MineStrator auto-renew
+        env:
+          MINESTRATOR_EMAIL: ${{ secrets.MINESTRATOR_EMAIL }}
+          MINESTRATOR_PASSWORD: ${{ secrets.MINESTRATOR_PASSWORD }}
+          MINESTRATOR_SERVER_ID: ${{ secrets.MINESTRATOR_SERVER_ID }}
+          MINESTRATOR_AUTH: ${{ secrets.MINESTRATOR_AUTH }}
+          MINESTRATOR_PROXY_NODES: ${{ secrets.MINESTRATOR_PROXY_NODES }}
+          PROXY_NODES: ${{ secrets.PROXY_NODES }}
+          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+        run: |
+          xvfb-run --auto-servernum python renew_minestrator.py --debug
+
+      - name: Upload error screenshot on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: minestrator-error-screenshot
+          path: error_screenshot.png
+          if-no-files-found: ignore
+
+      - name: Clear old workflow run logs
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          runs=$(gh run list --workflow="${{ github.workflow }}" --limit=100 --json databaseId --jq '.[].databaseId')
+          count=0
+          for run_id in $runs; do
+            count=$((count + 1))
+            if [ $count -gt 2 ]; then
+              echo "Deleting old run log: $run_id"
+              gh run delete $run_id || true
+            fi
+          done
+
+      - name: Commit time.txt to repo
+        if: always()
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          date '+%Y-%m-%d %H:%M:%S' > time.txt
+
+          git add time.txt
+          git commit -m "Update minestrator time.txt [skip ci]" || exit 0
+          git push origin HEAD:${{ github.ref_name }}
