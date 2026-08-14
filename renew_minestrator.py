@@ -182,6 +182,43 @@ def login_via_rest_api(email: str, password: str, proxy_url: str = None) -> tupl
     return False, "", {}
 
 
+def trigger_restart_via_rest_api(server_id: str, auth_token: str, proxy_url: str = None, signal: str = "restart") -> bool:
+    """通过 MineStrator / Pterodactyl REST API 直接下发 start / restart 电源控制指令。"""
+    endpoints = [
+        (f"https://mine.sttr.io/server/{server_id}/power", {"signal": signal}),
+        (f"https://minestrator.com/api/server/{server_id}/action", {"action": signal}),
+        (f"https://minestrator.com/api/server/{server_id}/power", {"signal": signal}),
+        (f"https://minestrator.com/api/server/{server_id}/{signal}", {})
+    ]
+    headers = {
+        "Authorization": auth_token if auth_token.startswith("Bearer ") else f"Bearer {auth_token}",
+        "Content-Type": "application/json",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        "Origin": "https://minestrator.com",
+        "Referer": f"https://minestrator.com/my/server/{server_id}"
+    }
+    handlers = []
+    if proxy_url:
+        handlers.append(urllib.request.ProxyHandler({"http": proxy_url, "https": proxy_url}))
+    opener = urllib.request.build_opener(*handlers)
+    
+    for url, payload in endpoints:
+        try:
+            req = urllib.request.Request(
+                url,
+                data=json.dumps(payload).encode('utf-8') if payload else b"",
+                headers=headers,
+                method="POST"
+            )
+            with opener.open(req, timeout=10) as resp:
+                if resp.status in [200, 204]:
+                    print(f"[+] ✅ 成功通过 REST API ({url.split('/')[-1]}) 下发 '{signal}' 开机/重启指令！")
+                    return True
+        except Exception:
+            pass
+    return False
+
+
 def trigger_restart_via_websocket(server_id: str, auth_token: str, proxy_url: str = None, signal: str = "start") -> bool:
     """通过底层 Pterodactyl Wings WebSocket 协议直接发送 start/restart 信号开机，绕过任何网页端与风控。"""
     try:
@@ -211,95 +248,123 @@ def trigger_restart_via_websocket(server_id: str, auth_token: str, proxy_url: st
         host = daemon_host_port[0]
         port = int(daemon_host_port[1])
         path = "/" + "/".join(parts[3:])
+        is_secure_url = ws_url.startswith("wss://")
 
         print(f"[*] 正在建立 Pterodactyl Wings WebSocket 直连控制通道 ({host}:{port}) ...")
 
-        ctx = ssl.create_default_context()
-        ctx.check_hostname = False
-        ctx.verify_mode = ssl.CERT_NONE
-
-        sock = None
-        if proxy_url:
-            p_parsed = urllib.parse.urlparse(proxy_url)
-            p_host = p_parsed.hostname
-            p_port = p_parsed.port
-            raw_sock = socket.create_connection((p_host, p_port), timeout=10)
-            connect_req = f"CONNECT {host}:{port} HTTP/1.1\r\nHost: {host}:{port}\r\n\r\n"
-            raw_sock.sendall(connect_req.encode('utf-8'))
-            conn_res = raw_sock.recv(4096).decode('utf-8', errors='ignore')
-            if "200" not in conn_res.splitlines()[0]:
-                print(f"[!] 代理隧道建立失败: {conn_res[:100]}")
-                return False
-            sock = raw_sock
-        else:
-            sock = socket.create_connection((host, port), timeout=10)
-
-        with ctx.wrap_socket(sock, server_hostname=host) as s:
-            sec_key = base64.b64encode(os.urandom(16)).decode('utf-8')
-            req_lines = [
-                f"GET {path} HTTP/1.1",
-                f"Host: {host}:{port}",
-                "Upgrade: websocket",
-                "Connection: Upgrade",
-                f"Sec-WebSocket-Key: {sec_key}",
-                "Sec-WebSocket-Version: 13",
-                "Origin: https://minestrator.com",
-                "User-Agent: Mozilla/5.0",
-                "", ""
-            ]
-            s.sendall("\r\n".join(req_lines).encode('utf-8'))
-            resp_txt = s.recv(4096).decode('utf-8', errors='ignore')
-            if "101" not in resp_txt.splitlines()[0]:
-                print(f"[-] WebSocket 握手失败: {resp_txt[:100]}")
-                return False
-
-            def make_frame(msg_str):
-                payload = msg_str.encode('utf-8')
-                length = len(payload)
-                mask_key = os.urandom(4)
-                masked = bytearray(length)
-                for i in range(length):
-                    masked[i] = payload[i] ^ mask_key[i % 4]
-                hdr = bytearray([0x81])
-                if length <= 125:
-                    hdr.append(0x80 | length)
-                elif length <= 65535:
-                    hdr.append(0x80 | 126)
-                    hdr.extend(length.to_bytes(2, 'big'))
-                else:
-                    hdr.append(0x80 | 127)
-                    hdr.extend(length.to_bytes(8, 'big'))
-                hdr.extend(mask_key)
-                hdr.extend(masked)
-                return bytes(hdr)
-
-            # 发送 WebSocket 鉴权消息
-            auth_msg = json.dumps({"event": "auth", "args": [token]})
-            s.sendall(make_frame(auth_msg))
-
-            # 必须等待服务器返回 auth success 鉴权成功帧后，再发送控制指令
-            authed = False
-            s.settimeout(5)
-            for _ in range(5):
-                try:
-                    raw = s.recv(4096)
-                    txt = raw.decode('utf-8', errors='ignore')
-                    if "auth success" in txt:
-                        authed = True
-                        break
-                except Exception:
-                    break
-
-            if authed:
-                print(f"[+] ✅ WebSocket 鉴权成功 (auth success)，下发 '{signal}' 指令刷新 4 小时倒计时...")
-                state_msg = json.dumps({"event": "set state", "args": [signal]})
-                s.sendall(make_frame(state_msg))
-                time.sleep(1)
-                print(f"[+] ✅ 成功通过 Pterodactyl WebSocket 下发 '{signal}' 开机/重启控制信号！")
-                return True
+        def connect_and_handshake(use_ssl: bool):
+            sock = None
+            if proxy_url:
+                p_parsed = urllib.parse.urlparse(proxy_url)
+                p_host = p_parsed.hostname
+                p_port = p_parsed.port
+                raw_sock = socket.create_connection((p_host, p_port), timeout=10)
+                connect_req = f"CONNECT {host}:{port} HTTP/1.1\r\nHost: {host}:{port}\r\n\r\n"
+                raw_sock.sendall(connect_req.encode('utf-8'))
+                conn_res = raw_sock.recv(4096).decode('utf-8', errors='ignore')
+                if "200" not in conn_res.splitlines()[0]:
+                    raise ConnectionError(f"代理隧道建立失败: {conn_res[:100]}")
+                sock = raw_sock
             else:
-                print("[-] Pterodactyl WebSocket 鉴权等待超时。")
-                return False
+                sock = socket.create_connection((host, port), timeout=10)
+
+            if use_ssl:
+                ctx = ssl.create_default_context()
+                ctx.check_hostname = False
+                ctx.verify_mode = ssl.CERT_NONE
+                return ctx.wrap_socket(sock, server_hostname=host)
+            return sock
+
+        # 优先按 URL 协议探测，遇到 TLS 握手 EOF / 异常自动自适应回退
+        s = None
+        for ssl_attempt in ([True, False] if is_secure_url else [False, True]):
+            try:
+                s = connect_and_handshake(ssl_attempt)
+                sec_key = base64.b64encode(os.urandom(16)).decode('utf-8')
+                req_lines = [
+                    f"GET {path} HTTP/1.1",
+                    f"Host: {host}:{port}",
+                    "Upgrade: websocket",
+                    "Connection: Upgrade",
+                    f"Sec-WebSocket-Key: {sec_key}",
+                    "Sec-WebSocket-Version: 13",
+                    "Origin: https://minestrator.com",
+                    "User-Agent: Mozilla/5.0",
+                    "", ""
+                ]
+                s.sendall("\r\n".join(req_lines).encode('utf-8'))
+                resp_txt = s.recv(4096).decode('utf-8', errors='ignore')
+                if "101" in resp_txt.splitlines()[0]:
+                    break
+                s.close()
+                s = None
+            except Exception:
+                if s:
+                    try:
+                        s.close()
+                    except Exception:
+                        pass
+                    s = None
+
+        if not s:
+            print("[-] WebSocket 连接握手未通过。")
+            return False
+
+        def make_frame(msg_str):
+            payload = msg_str.encode('utf-8')
+            length = len(payload)
+            mask_key = os.urandom(4)
+            masked = bytearray(length)
+            for i in range(length):
+                masked[i] = payload[i] ^ mask_key[i % 4]
+            hdr = bytearray([0x81])
+            if length <= 125:
+                hdr.append(0x80 | length)
+            elif length <= 65535:
+                hdr.append(0x80 | 126)
+                hdr.extend(length.to_bytes(2, 'big'))
+            else:
+                hdr.append(0x80 | 127)
+                hdr.extend(length.to_bytes(8, 'big'))
+            hdr.extend(mask_key)
+            hdr.extend(masked)
+            return bytes(hdr)
+
+        # 发送 WebSocket 鉴权消息
+        auth_msg = json.dumps({"event": "auth", "args": [token]})
+        s.sendall(make_frame(auth_msg))
+
+        # 必须等待服务器返回 auth success 鉴权成功帧后，再发送控制指令
+        authed = False
+        s.settimeout(6)
+        for _ in range(6):
+            try:
+                raw = s.recv(4096)
+                txt = raw.decode('utf-8', errors='ignore')
+                if "auth success" in txt:
+                    authed = True
+                    break
+            except Exception:
+                break
+
+        if authed:
+            print(f"[+] ✅ WebSocket 鉴权成功 (auth success)，下发 '{signal}' 指令刷新 4 小时倒计时...")
+            state_msg = json.dumps({"event": "set state", "args": [signal]})
+            s.sendall(make_frame(state_msg))
+            time.sleep(1)
+            print(f"[+] ✅ 成功通过 Pterodactyl WebSocket 下发 '{signal}' 开机/重启控制信号！")
+            try:
+                s.close()
+            except Exception:
+                pass
+            return True
+        else:
+            print("[-] Pterodactyl WebSocket 鉴权等待超时。")
+            try:
+                s.close()
+            except Exception:
+                pass
+            return False
 
     except Exception as e:
         print(f"[!] Pterodactyl WebSocket 直连控制尝试失败: {e}")
@@ -455,7 +520,7 @@ def trigger_restart_via_playwright(email: str, password: str, server_id: str, pr
             except Exception as ex:
                 print(f"[!] 30 天 Box 续期检测尝试跳过: {ex}")
 
-            # 精确与通用 Selector (包含 data-onboarding="start-button")
+            # 精确与通用 Selector (包含多语言、图标选择器、class 与 title)
             selectors = [
                 "button[data-onboarding='start-button']",
                 "[data-onboarding='start-button']",
@@ -466,7 +531,22 @@ def trigger_restart_via_playwright(email: str, password: str, server_id: str, pr
                 "button:has-text('Démarrer')",
                 "a:has-text('Démarrer')",
                 "button:has-text('Restart')",
-                "button:has-text('Redémarrer')"
+                "button:has-text('Redémarrer')",
+                "button:has-text('Relancer')",
+                "button:has-text('Recommencer')",
+                "button:has(i.fa-redo)",
+                "button:has(i.fa-rotate-right)",
+                "button:has(i.fa-rotate)",
+                "button:has(i.fa-play)",
+                "button:has(i.fa-power-off)",
+                "[title*='Redémarrer']",
+                "[title*='Restart']",
+                "[title*='Démarrer']",
+                "[title*='Start']",
+                "[title*='Relancer']",
+                ".dropdown-item:has-text('Redémarrer')",
+                ".dropdown-item:has-text('Restart')",
+                ".dropdown-item:has-text('Relancer')"
             ]
             btn_selector = ", ".join(selectors)
 
@@ -476,7 +556,7 @@ def trigger_restart_via_playwright(email: str, password: str, server_id: str, pr
                     btn = page.locator(btn_selector).first
                     if btn.is_visible(timeout=3000):
                         btn.evaluate("el => el.click()")
-                        print(f"[+] 成功在 {page_name} (Playwright Locator) 点击 Start 按钮！")
+                        print(f"[+] 成功在 {page_name} (Playwright Locator) 点击 Start / Restart 按钮！")
                         page.wait_for_timeout(5000)
                         return True
                 except Exception as ex:
@@ -484,22 +564,37 @@ def trigger_restart_via_playwright(email: str, password: str, server_id: str, pr
 
                 try:
                     js_clicked = page.evaluate("""() => {
+                        const keywords = ['start', 'démarrer', 'restart', 'redémarrer', 'relancer', 'recommencer'];
                         const btn = document.querySelector('[data-onboarding="start-button"]') ||
                                     document.querySelector('[data-onboarding*="start"]') ||
                                     document.querySelector('[data-onboarding*="restart"]') ||
-                                    Array.from(document.querySelectorAll('button, a')).find(b => {
-                                        const txt = (b.textContent || '').trim();
-                                        return txt.includes('Start') || txt.includes('Démarrer') || txt.includes('Restart') || txt.includes('Redémarrer');
+                                    Array.from(document.querySelectorAll('button, a, .btn')).find(b => {
+                                        const txt = (b.textContent || '').trim().toLowerCase();
+                                        const title = (b.getAttribute('title') || '').toLowerCase();
+                                        const aria = (b.getAttribute('aria-label') || '').toLowerCase();
+                                        return keywords.some(k => txt.includes(k) || title.includes(k) || aria.includes(k));
                                     });
                         if (btn) { btn.click(); return true; }
                         return false;
                     }""")
                     if js_clicked:
-                        print(f"[+] 成功在 {page_name} (JS querySelector) 点击 Start 按钮！")
+                        print(f"[+] 成功在 {page_name} (JS querySelector) 点击 Start / Restart 按钮！")
                         page.wait_for_timeout(5000)
                         return True
                 except Exception as ex:
                     print(f"[!] {page_name} JS evaluate 尝试跳过: {ex}")
+
+                # 兜底尝试向 Console 输入框下发 restart 控制台指令
+                try:
+                    cmd_input = page.locator("textarea[placeholder*='command'], input[placeholder*='command'], textarea[placeholder*='commande'], input[placeholder*='commande']").first
+                    if cmd_input.is_visible(timeout=2000):
+                        cmd_input.fill("restart")
+                        cmd_input.press("Enter")
+                        print(f"[+] 成功在 {page_name} (Console Terminal) 下发 'restart' 指令！")
+                        page.wait_for_timeout(3000)
+                        return True
+                except Exception:
+                    pass
 
                 return False
 
@@ -693,14 +788,21 @@ def main():
         print(f"[*] 监测到剩余关机时间 ({h:02d}h {m:02d}m {s:02d}s) 大于定时重启间隔 (3小时)，智能跳过本次重启。")
         power_success = True
     else:
-        print(f"[*] 服务器当前状态: {'Online (在线)' if is_online else 'Offline (离线)'}，优先尝试 WebSocket 下发 '{target_signal}' 信号重置 4 小时倒计时...")
-        power_success = trigger_restart_via_websocket(MINESTRATOR_SERVER_ID, active_auth, proxy_url, signal=target_signal)
+        print(f"[*] 服务器当前状态: {'Online (在线)' if is_online else 'Offline (离线)'}，优先尝试 REST API / WebSocket 下发 '{target_signal}' 信号重置 4 小时倒计时...")
         
+        # 1. 尝试 REST API 直发电源控制
+        power_success = trigger_restart_via_rest_api(MINESTRATOR_SERVER_ID, active_auth, proxy_url, signal=target_signal)
+        
+        # 2. 若 REST API 未直接支持，尝试 Pterodactyl WebSocket 通道
+        if not power_success:
+            power_success = trigger_restart_via_websocket(MINESTRATOR_SERVER_ID, active_auth, proxy_url, signal=target_signal)
+        
+        # 3. 若均未成功，降级尝试 Playwright 网页模拟
         if not power_success and MINESTRATOR_PASSWORD:
-            print("[!] WebSocket 通道未成功，降级尝试 Playwright 网页模拟...")
+            print("[!] WebSocket / REST API 通道未成功，降级尝试 Playwright 网页模拟...")
             power_success = trigger_restart_via_playwright(MINESTRATOR_EMAIL, MINESTRATOR_PASSWORD, MINESTRATOR_SERVER_ID, proxy_url, active_auth)
         elif not power_success:
-            print("[!] WebSocket 通道未成功，且未配置密码跳过 Playwright 网页模拟。")
+            print("[!] 未成功下发电源控制，且未配置密码跳过 Playwright 网页模拟。")
 
     overall_success = api_login_ok and power_success
 
