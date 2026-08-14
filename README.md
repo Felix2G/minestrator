@@ -25,8 +25,8 @@
 | `MINESTRATOR_PASSWORD` | **必填** | `YourPassword123` | MineStrator 账号登录密码（用于模拟登录并获取面板控制权） |
 | `MINESTRATOR_SERVER_ID` | **必填** | `123456` | 你的服务器数字 ID（见下文获取方式） |
 | `MINESTRATOR_AUTH` | *可选* | `Bearer Z1p...` | MineStrator API Token（留空时脚本会自动登录网页获取） |
-| `MINESTRATOR_PROXY_NODES` | *可选* | `vless://...` | **MineStrator 专用代理节点**（填入住宅/专线节点，不为空时自动启用本地代理） |
-| `PROXY_NODES` | *可选* | `vmess://...` | 备用代理节点链接（支持 VMess / VLESS） |
+| `MINESTRATOR_PROXY_NODES` | *可选* | `hy2://...` | **MineStrator 专用代理节点**（支持 Hysteria2 / VLESS / VMess / Trojan / SS / TUIC / Socks5 / HTTP） |
+| `PROXY_NODES` | *可选* | `vless://...` | 备用代理节点链接（支持上述全协议） |
 | `TG_BOT_TOKEN` | *可选* | `123456789:ABCdef...` | Telegram Bot Token，用于接收运行状态推送 |
 | `TG_CHAT_ID` | *可选* | `123456789` | 接收通知的 Telegram 个人或群组 Chat ID |
 

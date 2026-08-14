@@ -3,8 +3,8 @@
 代理节点解析、多节点测速与 Sing-box 客户端启动器 (MineStrator 专属版)
 ==============================================
 支持模式：
-1. 传统代理链接：http://, https://, socks5://
-2. 节点分享链接：vless://, vmess://, trojan://, ss://
+1. 节点分享链接：vless://, vmess://, hysteria2:// (hy2://), trojan://, ss://, tuic://
+2. 传统代理链接：socks5://, socks://, http://, https://
 
 精细化调优：
 - 自动清理 WebSocket path 中的 `?ed=2560` 早期数据伪报头，防止 Cloudflare WAF 抛出 Connection reset by peer
@@ -184,12 +184,253 @@ def parse_vmess_url(url_str: str) -> dict:
         return {}
 
 
+def parse_hysteria2_url(url_str: str) -> dict:
+    """解析 hysteria2:// 或 hy2:// 链接，生成 sing-box hysteria2 outbound 配置。"""
+    try:
+        # 兼容 hy2:// 协议头替换为标准 urlparse 支持的格式
+        norm_url = url_str
+        if norm_url.startswith("hy2://"):
+            norm_url = "hysteria2://" + norm_url[6:]
+
+        parsed = urllib.parse.urlparse(norm_url)
+        password = urllib.parse.unquote(parsed.username or parsed.password or "")
+        # 若格式为 hysteria2://auth@host:port
+        if not password and parsed.netloc and "@" in parsed.netloc:
+            password = parsed.netloc.split("@")[0]
+
+        host = parsed.hostname or ""
+        port = parsed.port or 443
+        query = urllib.parse.parse_qs(parsed.query)
+
+        def q(k, default=""):
+            return query.get(k, [default])[0]
+
+        server = host.strip("[]")
+        sni = q("sni") or server
+        insecure = q("insecure") in ["1", "true", "True"] or q("allowInsecure") in ["1", "true", "True"]
+
+        outbound = {
+            "type": "hysteria2",
+            "tag": "proxy",
+            "server": server,
+            "server_port": int(port),
+            "password": password,
+            "tls": {
+                "enabled": True,
+                "server_name": sni,
+                "insecure": insecure
+            }
+        }
+
+        # 混淆支持
+        obfs_type = q("obfs")
+        obfs_password = q("obfs-password") or q("obfs_password")
+        if obfs_type:
+            outbound["obfs"] = {
+                "type": obfs_type,
+                "password": obfs_password
+            }
+
+        return outbound
+    except Exception as e:
+        print(f"❌ 解析 Hysteria2 节点错误: {e}")
+        return {}
+
+
+def parse_trojan_url(url_str: str) -> dict:
+    """解析 trojan:// 链接，生成 sing-box trojan outbound 配置。"""
+    try:
+        parsed = urllib.parse.urlparse(url_str)
+        password = urllib.parse.unquote(parsed.username or "")
+        host = parsed.hostname or ""
+        port = parsed.port or 443
+        query = urllib.parse.parse_qs(parsed.query)
+
+        def q(k, default=""):
+            return query.get(k, [default])[0]
+
+        server = host.strip("[]")
+        sni = q("sni") or q("peer") or server
+        insecure = q("allowInsecure") in ["1", "true", "True"] or q("insecure") in ["1", "true", "True"]
+
+        if is_cloudflare_domain(server) and not re.match(r'^\d+\.\d+\.\d+\.\d+$', server):
+            server = "104.16.1.1"
+
+        outbound = {
+            "type": "trojan",
+            "tag": "proxy",
+            "server": server,
+            "server_port": int(port),
+            "password": password,
+            "tls": {
+                "enabled": True,
+                "server_name": sni,
+                "insecure": insecure
+            }
+        }
+
+        net_type = q("type") or q("net") or "tcp"
+        if net_type == "ws":
+            ws_path = clean_ws_path(q("path", "/"))
+            ws_host = q("host") or sni
+            outbound["transport"] = {
+                "type": "ws",
+                "path": ws_path,
+                "headers": {"Host": ws_host}
+            }
+
+        return outbound
+    except Exception as e:
+        print(f"❌ 解析 Trojan 节点错误: {e}")
+        return {}
+
+
+def parse_ss_url(url_str: str) -> dict:
+    """解析 shadowsocks (ss://) 链接，支持 SIP002 和 Legacy Base64 格式。"""
+    try:
+        # 去除前缀和 hashtag
+        raw = url_str[5:].split('#')[0]
+        method, password, server, port = "", "", "", 8388
+
+        if "@" in raw:
+            # SIP002 格式: ss://BASE64(method:password)@server:port/?params
+            userinfo_part, server_part = raw.split("@", 1)
+            # 处理 query 干扰
+            server_clean = server_part.split("/?")[0].split("?")[0]
+            if ":" in server_clean:
+                s_host, s_port = server_clean.rsplit(":", 1)
+                server = s_host.strip("[]")
+                port = int(s_port)
+
+            # 解码 userinfo
+            pad_len = len(userinfo_part) % 4
+            if pad_len:
+                userinfo_part += '=' * (4 - pad_len)
+            decoded_userinfo = base64.urlsafe_b64decode(userinfo_part.encode()).decode('utf-8', errors='ignore')
+            if ":" in decoded_userinfo:
+                method, password = decoded_userinfo.split(":", 1)
+        else:
+            # Legacy 格式: ss://BASE64(method:password@server:port)
+            pad_len = len(raw) % 4
+            if pad_len:
+                raw += '=' * (4 - pad_len)
+            decoded = base64.urlsafe_b64decode(raw.encode()).decode('utf-8', errors='ignore')
+            if "@" in decoded and ":" in decoded:
+                userinfo, server_info = decoded.split("@", 1)
+                method, password = userinfo.split(":", 1)
+                s_host, s_port = server_info.rsplit(":", 1)
+                server = s_host.strip("[]")
+                port = int(s_port)
+
+        if not server or not method:
+            print(f"❌ 解析 Shadowsocks 节点失败: 缺少核心字段 (method/server)")
+            return {}
+
+        return {
+            "type": "shadowsocks",
+            "tag": "proxy",
+            "server": server,
+            "server_port": port,
+            "method": method,
+            "password": password
+        }
+    except Exception as e:
+        print(f"❌ 解析 Shadowsocks 节点错误: {e}")
+        return {}
+
+
+def parse_tuic_url(url_str: str) -> dict:
+    """解析 tuic:// 链接，生成 sing-box tuic outbound 配置。"""
+    try:
+        parsed = urllib.parse.urlparse(url_str)
+        uuid = parsed.username or ""
+        password = parsed.password or ""
+        host = parsed.hostname or ""
+        port = parsed.port or 443
+        query = urllib.parse.parse_qs(parsed.query)
+
+        def q(k, default=""):
+            return query.get(k, [default])[0]
+
+        server = host.strip("[]")
+        sni = q("sni") or server
+        insecure = q("allow_insecure") in ["1", "true", "True"] or q("insecure") in ["1", "true", "True"]
+        congestion_control = q("congestion_control", "bbr")
+        alpn_str = q("alpn", "h3")
+        alpn_list = [a.strip() for a in alpn_str.split(",") if a.strip()]
+
+        return {
+            "type": "tuic",
+            "tag": "proxy",
+            "server": server,
+            "server_port": int(port),
+            "uuid": uuid,
+            "password": password,
+            "congestion_control": congestion_control,
+            "tls": {
+                "enabled": True,
+                "server_name": sni,
+                "alpn": alpn_list,
+                "insecure": insecure
+            }
+        }
+    except Exception as e:
+        print(f"❌ 解析 TUIC 节点错误: {e}")
+        return {}
+
+
+def parse_socks_http_url(url_str: str) -> dict:
+    """解析 socks5://, socks://, http://, https:// 标准代理链接。"""
+    try:
+        parsed = urllib.parse.urlparse(url_str)
+        scheme = parsed.scheme.lower()
+        host = parsed.hostname or ""
+        default_port = 443 if scheme == "https" else (1080 if "socks" in scheme else 80)
+        port = parsed.port or default_port
+        username = parsed.username or ""
+        password = parsed.password or ""
+
+        outbound_type = "socks" if "socks" in scheme else "http"
+        outbound = {
+            "type": outbound_type,
+            "tag": "proxy",
+            "server": host.strip("[]"),
+            "server_port": int(port)
+        }
+
+        if username:
+            outbound["username"] = username
+        if password:
+            outbound["password"] = password
+
+        if scheme == "https":
+            outbound["tls"] = {
+                "enabled": True,
+                "server_name": host.strip("[]")
+            }
+
+        return outbound
+    except Exception as e:
+        print(f"❌ 解析 Socks/HTTP 代理错误: {e}")
+        return {}
+
+
 def parse_node_to_outbound(node_url: str) -> dict:
     """自动判断协议类型并转为 sing-box outbound"""
     if node_url.startswith("vless://"):
         return parse_vless_url(node_url)
     elif node_url.startswith("vmess://"):
         return parse_vmess_url(node_url)
+    elif node_url.startswith(("hysteria2://", "hy2://")):
+        return parse_hysteria2_url(node_url)
+    elif node_url.startswith("trojan://"):
+        return parse_trojan_url(node_url)
+    elif node_url.startswith("ss://"):
+        return parse_ss_url(node_url)
+    elif node_url.startswith("tuic://"):
+        return parse_tuic_url(node_url)
+    elif node_url.startswith(("socks5://", "socks://", "http://", "https://")):
+        return parse_socks_http_url(node_url)
     return {}
 
 
